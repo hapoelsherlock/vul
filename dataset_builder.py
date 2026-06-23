@@ -588,13 +588,36 @@ def main():
     cve_repo_dir = base_dir / "cvelistv5"
     output_file = base_dir / "hard_vuln_benchmark.json"
     
-    if not cve_repo_dir.exists():
-        print("[*] Cloning CVE list repository...")
-        run_cmd(["git", "clone", "--depth", "1", "--filter=blob:none", "--sparse", "https://github.com/CVEProject/cvelistv5.git", str(cve_repo_dir)])
-        run_cmd(["git", "sparse-checkout", "set", "cves/2026"], cwd=cve_repo_dir)
-
+    # Always re-fetch CVE list (sparse checkout often fails)
+    print("[*] Fetching CVE list repository...")
+    if cve_repo_dir.exists():
+        shutil.rmtree(cve_repo_dir, ignore_errors=True)
+    
+    run_cmd(["git", "clone", "--depth", "1", "--filter=blob:none", "--sparse", 
+             "https://github.com/CVEProject/cvelistv5.git", str(cve_repo_dir)], timeout=120)
+    
+    # Try to checkout cves/2026
+    print("[*] Checking out cves/2026 directory...")
+    run_cmd(["git", "sparse-checkout", "set", "cves/2026"], cwd=cve_repo_dir, timeout=120)
+    
+    # If 2026 doesn't have files, try recent years
     cve_paths = list((cve_repo_dir / "cves" / "2026").glob("**/*.json"))
+    if not cve_paths:
+        print("[!] cves/2026 is empty, trying cves/2024...")
+        run_cmd(["git", "sparse-checkout", "set", "cves/2024"], cwd=cve_repo_dir, timeout=120)
+        cve_paths = list((cve_repo_dir / "cves" / "2024").glob("**/*.json"))
+    
+    if not cve_paths:
+        print("[!] cves/2024 is empty, trying cves/2023...")
+        run_cmd(["git", "sparse-checkout", "set", "cves/2023"], cwd=cve_repo_dir, timeout=120)
+        cve_paths = list((cve_repo_dir / "cves" / "2023").glob("**/*.json"))
+    
     print(f"[*] Found {len(cve_paths)} CVE JSON files to scan.")
+    
+    if not cve_paths:
+        print("[ERROR] Could not find any CVE files. Check the cvelistv5 repository structure.")
+        return
+    
     print(f"[*] Disk available: {get_disk_usage(base_dir)['free_gb']:.1f} GB\n")
     
     random.shuffle(cve_paths)
