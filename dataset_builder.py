@@ -8,20 +8,25 @@ from pathlib import Path
 from collections import deque
 import subprocess
 import random
+import sys
 
 # --- Silence Third-Party Deprecation Warnings ---
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 
-import tree_sitter_c as tsc
-import tree_sitter_cpp as tscpp
-from tree_sitter import Language, Parser
-
-# --- Tree-Sitter Initialization ---
-C_LANG = Language(tsc.language())
-CPP_LANG = Language(tscpp.language())
-
-C_PARSER = Parser(C_LANG)
-CPP_PARSER = Parser(CPP_LANG)
+# --- Tree-Sitter Initialization (Fixed) ---
+try:
+    from tree_sitter import Language, Parser
+    import tree_sitter_c as tsc
+    import tree_sitter_cpp as tscpp
+    
+    C_LANG = Language(tsc.language())
+    CPP_LANG = Language(tscpp.language())
+    C_PARSER = Parser(C_LANG)
+    CPP_PARSER = Parser(CPP_LANG)
+except ImportError as e:
+    print(f"[!] Tree-Sitter dependency error: {e}")
+    print("[!] Install with: pip install tree-sitter tree-sitter-c tree-sitter-cpp")
+    sys.exit(1)
 
 def get_parser_and_lang(file_path: str):
     ext = Path(file_path).suffix.lower()
@@ -32,10 +37,17 @@ def get_parser_and_lang(file_path: str):
 # --- Helper Utilities ---
 def run_cmd(args, cwd=None, timeout=60):
     try:
-        # Explicitly enforce UTF-8 and ignore weird characters to prevent Windows cp1252 crashes
-        res = subprocess.run(args, capture_output=True, encoding="utf-8", errors="ignore", cwd=cwd, timeout=timeout, check=True)
-        return res.stdout
-    except (subprocess.TimeoutExpired, subprocess.CalledProcessError):
+        res = subprocess.run(
+            args, 
+            capture_output=True, 
+            encoding="utf-8", 
+            errors="ignore", 
+            cwd=cwd, 
+            timeout=timeout, 
+            check=False  # Don't raise on non-zero exit
+        )
+        return res.stdout if res.returncode == 0 else ""
+    except (subprocess.TimeoutExpired, FileNotFoundError) as e:
         return ""
 
 def sanitize_text(text: str) -> str:
@@ -85,91 +97,77 @@ def check_repo_languages_via_api(owner: str, repo: str, github_token: str = None
         # If API fails or rate-limits, return uncertainty
         return {"has_c_cpp": None, "confidence": 0.0, "error": str(e), "languages": {}}
 
-def search_repos_for_c_cpp(github_token: str = None, stars_min: int = 100, language: str = "c") -> list:
-    """
-    Search for C/C++ repositories on GitHub that are likely to have real vulnerabilities.
-    Returns top matching repos with language breakdown.
-    """
-    url = f"https://api.github.com/search/repositories?q=language:{language}+stars:>{stars_min}&sort=stars&order=desc&per_page=30"
-    headers = {"User-Agent": "Mozilla/5.0 (VulnerabilityBenchmarkBuilder/1.0)", "Accept": "application/vnd.github.v3+json"}
-    
-    if github_token:
-        headers["Authorization"] = f"token {github_token}"
-    
-    req = urllib.request.Request(url, headers=headers)
-    try:
-        with urllib.request.urlopen(req, timeout=10) as response:
-            data = json.loads(response.read().decode())
-            repos = []
-            for item in data.get("items", []):
-                repos.append({
-                    "owner": item["owner"]["login"],
-                    "name": item["name"],
-                    "url": item["html_url"],
-                    "stars": item["stargazers_count"],
-                    "forks": item["forks_count"],
-                    "description": item["description"],
-                    "language": item["language"]
-                })
-            return repos
-    except Exception as e:
-        print(f"[!] Error searching repos: {e}")
-        return []
-
 # --- Core Tree-Sitter Indexing ---
 def query_ast(node, query_str, lang):
-    query = lang.query(query_str)
-    captures = query.captures(node)
-    return captures
+    try:
+        query = lang.query(query_str)
+        captures = query.captures(node)
+        return captures
+    except Exception:
+        return []
 
 def extract_functions_and_macros(file_path: str, source_code: str):
-    parser, lang = get_parser_and_lang(file_path)
-    tree = parser.parse(bytes(source_code, "utf8"))
-    root = tree.root_node
+    """Extract functions and macros from source code using Tree-Sitter."""
+    try:
+        parser, lang = get_parser_and_lang(file_path)
+        tree = parser.parse(bytes(source_code, "utf8"))
+        root = tree.root_node
 
-    functions = {}
-    macros = {}
+        functions = {}
+        macros = {}
 
-    macro_q = "(preproc_def name: (identifier) @name value: (_) @val)" if lang == C_LANG else "(preproc_def name: (identifier) @name)"
-    for node, tag in query_ast(root, macro_q, lang):
-        if tag == "name":
-            macros[node.text.decode('utf8', errors='ignore')] = source_code[node.start_byte:node.end_byte]
+        # Extract macros
+        macro_q = "(preproc_def name: (identifier) @name)"
+        for node, tag in query_ast(root, macro_q, lang):
+            if tag == "name":
+                try:
+                    macros[node.text.decode('utf8', errors='ignore')] = source_code[node.start_byte:node.end_byte]
+                except Exception:
+                    continue
 
-    func_q = "(function_definition) @func"
-    func_nodes = [cap[0] for cap in query_ast(root, func_q, lang)]
+        # Extract functions
+        func_q = "(function_definition) @func"
+        func_nodes = [cap[0] for cap in query_ast(root, func_q, lang)]
 
-    for fn in func_nodes:
-        name_node = None
-        decl_q = "(function_definition declarator: (_) @decl)"
-        decls = query_ast(fn, decl_q, lang)
-        if decls:
-            id_q = "(identifier) @id"
-            ids = query_ast(decls[0][0], id_q, lang)
-            if ids:
-                name_node = ids[-1][0]
+        for fn in func_nodes:
+            name_node = None
+            decl_q = "(function_definition declarator: (_) @decl)"
+            decls = query_ast(fn, decl_q, lang)
+            if decls:
+                id_q = "(identifier) @id"
+                ids = query_ast(decls[0][0], id_q, lang)
+                if ids:
+                    name_node = ids[-1][0]
 
-        if not name_node:
-            continue
+            if not name_node:
+                continue
 
-        func_name = name_node.text.decode('utf8', errors='ignore')
-        fn_text = source_code[fn.start_byte:fn.end_byte]
-        
-        call_q = "(call_expression function: (identifier) @callee)"
-        callees = set()
-        for c_node, _ in query_ast(fn, call_q, lang):
-            callees.add(c_node.text.decode('utf8', errors='ignore'))
+            func_name = name_node.text.decode('utf8', errors='ignore')
+            fn_text = source_code[fn.start_byte:fn.end_byte]
+            
+            # Extract callees
+            call_q = "(call_expression function: (identifier) @callee)"
+            callees = set()
+            for c_node, _ in query_ast(fn, call_q, lang):
+                try:
+                    callees.add(c_node.text.decode('utf8', errors='ignore'))
+                except Exception:
+                    continue
 
-        functions[func_name] = {
-            "name": func_name,
-            "body": fn_text,
-            "start_line": fn.start_point[0],
-            "end_line": fn.end_point[0],
-            "callees": list(callees)
-        }
+            functions[func_name] = {
+                "name": func_name,
+                "body": fn_text,
+                "start_line": fn.start_point[0],
+                "end_line": fn.end_point[0],
+                "callees": list(callees)
+            }
 
-    return functions, macros
+        return functions, macros
+    except Exception as e:
+        return {}, {}
 
 def find_vulnerable_function(file_path: str, source_code: str, target_line: int):
+    """Find the function containing the target line."""
     funcs, _ = extract_functions_and_macros(file_path, source_code)
     for name, info in funcs.items():
         if info["start_line"] <= target_line <= info["end_line"]:
@@ -185,6 +183,7 @@ class RepoContextGraph:
         self._build_index()
 
     def _build_index(self):
+        """Index all C/C++ files in the repository."""
         extensions = {'.c', '.h', '.cpp', '.hpp', '.cc', '.cxx'}
         for root, _, files in os.walk(self.repo_dir):
             for file in files:
@@ -193,6 +192,8 @@ class RepoContextGraph:
                     rel_path = str(full_path.relative_to(self.repo_dir))
                     try:
                         content = full_path.read_text(errors='ignore')
+                        if not content or len(content) > 5_000_000:  # Skip huge files
+                            continue
                         funcs, macros = extract_functions_and_macros(rel_path, content)
                         self.file_indices[rel_path] = (funcs, macros)
                         
@@ -205,6 +206,7 @@ class RepoContextGraph:
                         continue
 
     def get_macros_used(self, body_text: str) -> list:
+        """Find macros referenced in function body."""
         tokens = set(re.findall(r'\b[A-Z_][A-Z0-9_]*\b', body_text))
         found = []
         for _, (_, macros) in self.file_indices.items():
@@ -214,13 +216,16 @@ class RepoContextGraph:
         return found[:10]
 
     def get_siblings(self, file_path: str, target_func: str, count=2) -> list:
-        if file_path not in self.file_indices: return []
+        """Get sibling functions in same file."""
+        if file_path not in self.file_indices: 
+            return []
         funcs, _ = self.file_indices[file_path]
         siblings = [f["body"] for name, f in funcs.items() if name != target_func]
         random.shuffle(siblings)
         return [sanitize_text(s) for s in siblings[:count]]
 
     def resolve_callees(self, callee_names: list) -> list:
+        """Resolve called functions to their definitions."""
         resolved = []
         for name in callee_names:
             for file_path, (funcs, _) in self.file_indices.items():
@@ -234,6 +239,7 @@ class RepoContextGraph:
         return resolved[:5]
 
     def trace_callers_bfs(self, start_func: str, max_depth=3) -> list:
+        """BFS to find functions that call the target."""
         visited = set()
         queue = deque([(start_func, 1)])
         results = []
@@ -259,7 +265,7 @@ class RepoContextGraph:
         return results
 
     def extract_negative_samples(self, exclude_func: str = None, count: int = 5) -> list:
-        """Extract random functions from repo that aren't the vulnerable one (negative samples)."""
+        """Extract random non-vulnerable functions."""
         all_funcs = []
         for file_path, (funcs, _) in self.file_indices.items():
             for func_name, func_info in funcs.items():
@@ -272,12 +278,11 @@ class RepoContextGraph:
                     "lines": func_info["end_line"] - func_info["start_line"]
                 })
         
-        # Shuffle and prefer similarly-sized functions for harder discrimination
         random.shuffle(all_funcs)
         return all_funcs[:count]
 
     def get_external_lib_calls(self, func_body: str) -> list:
-        """Extract library calls (stdlib, POSIX, etc.) to add realistic context."""
+        """Extract library calls."""
         common_libs = {
             'malloc', 'free', 'calloc', 'realloc',
             'strcpy', 'strcat', 'sprintf', 'printf', 'gets',
@@ -299,13 +304,12 @@ def infer_vuln_type(diff_out: str, vuln_func: str) -> str:
     diff_lower = diff_out.lower()
     
     patterns = {
-        "buffer_overflow": [r'strcpy', r'strcat', r'sprintf', r'gets', r'\[.*\].*=', r'memcpy.*size'],
-        "use_after_free": [r'free\s*\(', r'delete\s+', r'realloc', r'->.*after.*free'],
-        "integer_overflow": [r'\+\s*\w+', r'\*\s*\w+', r'<<', r'size.*\+'],
-        "sql_injection": [r'query', r'sql', r'select.*from'],
-        "format_string": [r'printf.*%', r'sprintf.*%', r'fprintf.*%'],
-        "race_condition": [r'pthread', r'mutex', r'lock', r'thread'],
-        "null_pointer_dereference": [r'->', r'\*\w+', r'\[\d+\]'],
+        "buffer_overflow": [r'strcpy', r'strcat', r'sprintf', r'gets'],
+        "use_after_free": [r'free\s*\(', r'delete\s+'],
+        "integer_overflow": [r'size.*\+', r'size.*\*'],
+        "format_string": [r'printf.*%', r'sprintf.*%'],
+        "race_condition": [r'pthread', r'thread'],
+        "null_pointer_dereference": [r'->', r'\*\w+'],
     }
     
     scores = {}
@@ -317,12 +321,10 @@ def infer_vuln_type(diff_out: str, vuln_func: str) -> str:
         if score > 0:
             scores[vuln_type] = score
     
-    if scores:
-        return max(scores, key=scores.get)
-    return "unknown"
+    return max(scores, key=scores.get) if scores else "unknown"
 
-def analyze_patch_complexity(diff_out: str, target_file: str) -> dict:
-    """Score patch difficulty based on scope and magnitude."""
+def analyze_patch_complexity(diff_out: str) -> dict:
+    """Score patch difficulty."""
     lines_added = len([l for l in diff_out.splitlines() if l.startswith('+')])
     lines_removed = len([l for l in diff_out.splitlines() if l.startswith('-')])
     lines_changed = lines_added + lines_removed
@@ -330,21 +332,14 @@ def analyze_patch_complexity(diff_out: str, target_file: str) -> dict:
     files_touched = len(re.findall(r'^--- a/', diff_out, re.MULTILINE))
     hunks = len(re.findall(r'^@@', diff_out, re.MULTILINE))
     
-    is_minimal = lines_changed <= 5
-    is_scattered = files_touched > 1 or hunks > 3
-    is_large = lines_changed > 50
-    
-    # Classify difficulty
-    if is_minimal and not is_scattered:
+    if lines_changed <= 5:
         difficulty = "trivial"
-    elif lines_changed < 20 and hunks <= 2:
+    elif lines_changed < 20:
         difficulty = "easy"
-    elif lines_changed < 50 and not is_scattered:
+    elif lines_changed < 50:
         difficulty = "moderate"
-    elif is_large or is_scattered:
-        difficulty = "hard"
     else:
-        difficulty = "moderate"
+        difficulty = "hard"
     
     return {
         "lines_added": lines_added,
@@ -352,21 +347,17 @@ def analyze_patch_complexity(diff_out: str, target_file: str) -> dict:
         "total_lines_changed": lines_changed,
         "files_touched": files_touched,
         "hunks": hunks,
-        "is_minimal_patch": is_minimal,
-        "is_scattered_fix": is_scattered,
-        "is_large_patch": is_large,
         "difficulty_score": difficulty
     }
 
 def extract_commit_message(repo_cache_dir: Path, sha: str) -> str:
-    """Extract commit message (may or may not mention the vuln)."""
+    """Extract commit message."""
     msg = run_cmd(["git", "log", "-1", "--pretty=%B", sha], cwd=repo_cache_dir)
     return sanitize_text(msg) if msg else ""
 
 def get_intermediate_commits(repo_cache_dir: Path, vuln_sha: str, target_file: str, max_commits: int = 3) -> list:
-    """Fetch commits between vuln introduction and fix to add temporal confusion."""
+    """Fetch commits after vulnerability introduction."""
     try:
-        # Get commits after the vulnerable one
         log_output = run_cmd(["git", "log", "--oneline", f"{vuln_sha}..HEAD", "--", target_file], cwd=repo_cache_dir)
         if not log_output:
             return []
@@ -382,7 +373,7 @@ def get_intermediate_commits(repo_cache_dir: Path, vuln_sha: str, target_file: s
                     results.append({
                         "sha": commit,
                         "message": sanitize_text(msg),
-                        "code_snippet": sanitize_text(code[:500])  # First 500 chars for context
+                        "code_snippet": sanitize_text(code[:500])
                     })
             except Exception:
                 continue
@@ -392,7 +383,7 @@ def get_intermediate_commits(repo_cache_dir: Path, vuln_sha: str, target_file: s
         return []
 
 def detect_conditional_compilation(func_body: str) -> list:
-    """Detect #ifdef, #if defined, etc. that might affect compilation."""
+    """Detect preprocessor directives."""
     patterns = [
         r'#ifdef\s+(\w+)',
         r'#if\s+defined\s*\(\s*(\w+)\s*\)',
@@ -404,8 +395,8 @@ def detect_conditional_compilation(func_body: str) -> list:
         conditions.extend(matches)
     return list(set(conditions))
 
-def categorize_distractors(graph: RepoContextGraph, vuln_func_info: dict, target_file: str, count_per_level: int = 2) -> dict:
-    """Create distractors at different difficulty levels."""
+def categorize_distractors(graph: RepoContextGraph, vuln_func_info: dict, count_per_level: int = 2) -> dict:
+    """Create difficulty-stratified distractors."""
     negative_samples = graph.extract_negative_samples(exclude_func=vuln_func_info["name"], count=count_per_level * 3)
     
     vuln_size = vuln_func_info["end_line"] - vuln_func_info["start_line"]
@@ -420,13 +411,10 @@ def categorize_distractors(graph: RepoContextGraph, vuln_func_info: dict, target
         lib_overlap = len(vuln_libs & sample_libs) / max(len(vuln_libs), 1)
         size_similarity = abs(sample["lines"] - vuln_size) / max(vuln_size, 1)
         
-        # Easy: completely different size and libraries
         if size_similarity > 2 or lib_overlap < 0.2:
             easy.append(sample)
-        # Hard: similar size and libraries but different logic
         elif size_similarity < 0.5 and lib_overlap > 0.5:
             hard.append(sample)
-        # Medium: somewhere in between
         else:
             medium.append(sample)
     
@@ -438,8 +426,12 @@ def categorize_distractors(graph: RepoContextGraph, vuln_func_info: dict, target
 
 # --- Processing Pipeline Engine ---
 def process_single_cve(cve_json_path: Path, work_dir: Path, active_session_repos: set, github_token: str = None):
-    with open(cve_json_path, 'r') as f:
-        data = json.load(f)
+    """Process a single CVE record and extract vulnerability context."""
+    try:
+        with open(cve_json_path, 'r') as f:
+            data = json.load(f)
+    except Exception as e:
+        return None
 
     cve_id = data.get("cveMetadata", {}).get("cveId", "UNKNOWN")
     
@@ -450,7 +442,7 @@ def process_single_cve(cve_json_path: Path, work_dir: Path, active_session_repos
 
     owner, repo, sha = commit_matches[0]
     
-    # --- GitHub API Optimization Filter ---
+    # --- GitHub API Language Check ---
     lang_check = check_repo_languages_via_api(owner, repo, github_token)
     if not lang_check.get("has_c_cpp"):
         return None
@@ -458,45 +450,52 @@ def process_single_cve(cve_json_path: Path, work_dir: Path, active_session_repos
     repo_url = f"https://github.com/{owner}/{repo}.git"
     repo_cache_dir = work_dir / f"{owner}_{repo}"
 
-    print(f"\n[*] Match found in {cve_id}! Target repo: {owner}/{repo} (C/C++: {lang_check['confidence']:.1%})")
+    print(f"\n[*] Processing {cve_id}: {owner}/{repo} (C/C++: {lang_check['confidence']:.1%})")
     active_session_repos.add(repo_cache_dir)
 
+    # Clone if needed
     if not repo_cache_dir.exists():
-        print(f"    -> Repository not cached. Cloning shallow tree from GitHub...")
+        print(f"    -> Cloning repository...")
         run_cmd(["git", "clone", "--depth", "50", repo_url, str(repo_cache_dir)])
     
+    # Fetch commits
     run_cmd(["git", "fetch", "origin", sha], cwd=repo_cache_dir)
     
-    parent_sha = run_cmd(["git", "cat-file", "-p", sha], cwd=repo_cache_dir)
-    parent_match = re.search(r'parent\s([a-f0-9]{40})', parent_sha)
+    # Get parent commit
+    parent_out = run_cmd(["git", "cat-file", "-p", sha], cwd=repo_cache_dir)
+    parent_match = re.search(r'parent\s([a-f0-9]{40})', parent_out)
     if not parent_match:
-        print(f"    -> Skipped: Could not trace parent commit for {sha}.")
         return None
         
     p_sha = parent_match.group(1)
     run_cmd(["git", "fetch", "origin", p_sha], cwd=repo_cache_dir)
 
+    # Get diff
     diff_out = run_cmd(["git", "diff", p_sha, sha], cwd=repo_cache_dir)
+    if not diff_out:
+        return None
     
+    # Parse diff to find C/C++ file changes
     target_file = None
-    target_line = None
-    file_header_re = re.compile(r'^--- a/(.*\.(?:c|cpp|cc|cxx|h|hpp))$')
-    hunk_re = re.compile(r'^@@ -\d+,(\d+) \+\d+,\d+ @@')
-
-    for line in diff_out.splitlines():
-        fm = file_header_re.match(line)
-        if fm:
-            target_file = fm.group(1)
-            continue
-        hm = hunk_re.match(line)
-        if hm and target_file:
-            target_line = int(hm.group(1))
-            break
-
-    if not target_file or not target_line:
-        print(f"    -> Skipped: Patch did not modify a C/C++ source code file.")
+    file_header_re = re.compile(r'^--- a/(.*\.(?:c|cpp|cc|cxx|h|hpp))$', re.MULTILINE)
+    matches = file_header_re.findall(diff_out)
+    if matches:
+        target_file = matches[0]
+    
+    if not target_file:
         return None
 
+    # Extract line number from hunk header (use + line number for new file)
+    target_line = None
+    hunk_re = re.compile(r'^@@ -(\d+)(?:,\d+)? \+(\d+)')
+    for match in hunk_re.finditer(diff_out):
+        target_line = int(match.group(2))
+        break
+    
+    if not target_line:
+        return None
+
+    # Checkout parent commit and extract function
     run_cmd(["git", "checkout", "-f", p_sha], cwd=repo_cache_dir)
     
     full_file_path = repo_cache_dir / target_file
@@ -507,19 +506,18 @@ def process_single_cve(cve_json_path: Path, work_dir: Path, active_session_repos
 
     vuln_func_info = find_vulnerable_function(target_file, pre_patch_code, target_line)
     if not vuln_func_info:
-        print(f"    -> Skipped: Diff hunk line {target_line} dropped outside a traceable function declaration block.")
         return None
 
-    print(f"    -> Building Graph Context around function: '{vuln_func_info['name']}'")
+    print(f"    -> Found vulnerable function: '{vuln_func_info['name']}'")
     graph = RepoContextGraph(repo_cache_dir)
     
-    # --- Enhanced Context Collection ---
-    patch_complexity = analyze_patch_complexity(diff_out, target_file)
+    # Collect context
+    patch_complexity = analyze_patch_complexity(diff_out)
     vuln_type = infer_vuln_type(diff_out, vuln_func_info["body"])
     commit_msg = extract_commit_message(repo_cache_dir, sha)
     intermediate_commits = get_intermediate_commits(repo_cache_dir, p_sha, target_file, max_commits=3)
     conditionals = detect_conditional_compilation(vuln_func_info["body"])
-    distractors = categorize_distractors(graph, vuln_func_info, target_file, count_per_level=2)
+    distractors = categorize_distractors(graph, vuln_func_info, count_per_level=2)
     external_libs = graph.get_external_lib_calls(vuln_func_info["body"])
     
     enriched_context = {
@@ -557,12 +555,11 @@ def process_single_cve(cve_json_path: Path, work_dir: Path, active_session_repos
         "label": 1
     }
 
-# --- Execution Entrypoint Orchestration ---
+# --- Main Execution ---
 def main():
-    # Get GitHub token from environment for better API rate limits
     github_token = os.getenv("GITHUB_TOKEN")
     if not github_token:
-        print("[!] Warning: GITHUB_TOKEN not set. API rate limits will be lower. Set it with: export GITHUB_TOKEN=your_token")
+        print("[!] Warning: GITHUB_TOKEN not set. Set it for better API rate limits: export GITHUB_TOKEN=your_token")
     
     base_dir = Path("./vuln_benchmark_builder")
     base_dir.mkdir(exist_ok=True)
@@ -571,19 +568,17 @@ def main():
     output_file = base_dir / "hard_vuln_benchmark.json"
     
     if not cve_repo_dir.exists():
-        print("[*] Performing sparse clone on cvelistv5...")
+        print("[*] Cloning CVE list repository...")
         run_cmd(["git", "clone", "--depth", "1", "--filter=blob:none", "--sparse", "https://github.com/CVEProject/cvelistv5.git", str(cve_repo_dir)])
         run_cmd(["git", "sparse-checkout", "set", "cves/2026"], cwd=cve_repo_dir)
 
     cve_paths = list((cve_repo_dir / "cves" / "2026").glob("**/*.json"))
     print(f"[*] Found {len(cve_paths)} CVE JSON files to scan.")
     
-    # Break the sequential batch assignment patterns of CVE-IDs
     random.shuffle(cve_paths)
 
     dataset = []
     limit = 30  
-    
     active_session_repos = set()
     cleanup_counter = 0
 
@@ -591,27 +586,24 @@ def main():
         if len(dataset) >= limit:
             break
             
-        print(f"[*] Scanning records index: {idx}/{len(cve_paths)} (Benchmark Progress: {len(dataset)}/{limit})", end="\r")
+        print(f"[*] Progress: {len(dataset)}/{limit} | Scanning index {idx}/{len(cve_paths)}", end="\r")
         
         try:
             record = process_single_cve(path, base_dir, active_session_repos, github_token)
             if record:
                 dataset.append(record)
-                print(f"[+] Successfully saved benchmark record {len(dataset)}/{limit} ({record['cve_id']})")
+                print(f"[+] Record {len(dataset)}/{limit}: {record['cve_id']:<15} | {record['metadata']['vulnerability_type']:<20}")
                 cleanup_counter = 0  
             else:
                 cleanup_counter += 1
 
-            # Garbage Collection Check: If 10 consecutive entries fail, clean unutilized directories
+            # Cleanup if too many failures
             if cleanup_counter >= 10:
                 if active_session_repos:
-                    print(f"\n[!] Garbage Collection: Wiping {len(active_session_repos)} unutilized target repos to free disk space...")
+                    print(f"\n[!] Cleaning up {len(active_session_repos)} unused repos...")
                     for repo_path in list(active_session_repos):
                         if repo_path.exists():
-                            try:
-                                shutil.rmtree(repo_path, ignore_errors=True)
-                            except Exception:
-                                pass
+                            shutil.rmtree(repo_path, ignore_errors=True)
                     active_session_repos.clear()
                 cleanup_counter = 0 
 
@@ -619,9 +611,11 @@ def main():
             cleanup_counter += 1
             continue
 
+    # Save output
     with open(output_file, 'w') as out:
         json.dump(dataset, out, indent=2)
-    print(f"\n[!] Done! Hard benchmark saved to {output_file.resolve()}")
+    
+    print(f"\n[✓] Done! Saved {len(dataset)} records to {output_file.resolve()}")
 
 if __name__ == "__main__":
     main()
